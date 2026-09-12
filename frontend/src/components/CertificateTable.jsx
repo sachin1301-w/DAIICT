@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { api } from "../api.js";
+import BlockchainStatusBadge from "./BlockchainStatusBadge.jsx";
 
 const STATUS_TONE = {
   ACTIVE: "bg-emerald-900/40 text-emerald-400",
@@ -8,7 +9,7 @@ const STATUS_TONE = {
   HELD: "bg-amber-900/40 text-amber-400",
 };
 
-export default function CertificateTable() {
+export default function CertificateTable({ resetEpoch = 0 }) {
   const [certs, setCerts] = useState([]);
   const [filter, setFilter] = useState("");
   const [busy, setBusy] = useState(null);
@@ -17,7 +18,7 @@ export default function CertificateTable() {
     api.certificates(filter || undefined).then(setCerts).catch(() => {});
   }
 
-  useEffect(load, [filter]);
+  useEffect(load, [filter, resetEpoch]);
 
   async function retire(recId) {
     setBusy(recId);
@@ -71,6 +72,7 @@ export default function CertificateTable() {
               <th className="text-left px-4 py-3">Quantity</th>
               <th className="text-left px-4 py-3">Owner</th>
               <th className="text-left px-4 py-3">Status</th>
+              <th className="text-left px-4 py-3">Blockchain</th>
               <th className="text-left px-4 py-3">Blockchain Tx</th>
               <th className="text-left px-4 py-3">Actions</th>
             </tr>
@@ -84,6 +86,9 @@ export default function CertificateTable() {
                 <td className="px-4 py-2.5 font-mono truncate max-w-[140px]">{c.current_owner}</td>
                 <td className="px-4 py-2.5">
                   <span className={`badge ${STATUS_TONE[c.status] || ""}`}>{c.status}</span>
+                </td>
+                <td className="px-4 py-2.5">
+                  <BlockchainStatusBadge status={c.blockchain_status} title={c.blockchain_verification_message} />
                 </td>
                 <td className="px-4 py-2.5 font-mono truncate max-w-[120px]">
                   {c.blockchain_tx_hash ? c.blockchain_tx_hash.slice(0, 12) + "..." : "pending sync"}
@@ -112,7 +117,7 @@ export default function CertificateTable() {
             ))}
             {certs.length === 0 && (
               <tr>
-                <td colSpan={7} className="px-4 py-8 text-center text-slate-500">
+                <td colSpan={8} className="px-4 py-8 text-center text-slate-500">
                   No certificates yet.
                 </td>
               </tr>

@@ -55,6 +55,13 @@ class RECRecord(Base):
     current_owner = Column(String(64), nullable=True)
     blockchain_tx_hash = Column(String(80), nullable=True)
     generation_hash = Column(String(66), nullable=True)
+    # PASSED | FAILED | PENDING | NOT_CONNECTED -- see pipeline._blockchain_settlement.
+    # Defaults to PENDING: true until some chain call actually classifies it,
+    # never silently reads as PASSED just because nothing has run yet.
+    blockchain_status = Column(String(20), default="PENDING")
+    blockchain_record_hash = Column(String(66), nullable=True)
+    blockchain_verification_message = Column(String(200), nullable=True)
+    blockchain_verified_at = Column(Float, nullable=True)
     created_at = Column(Float, default=time.time)
 
 
@@ -70,6 +77,10 @@ class RECTransaction(Base):
     quantity = Column(Float, nullable=False)
     transaction_timestamp = Column(Float, default=time.time)
     blockchain_tx_hash = Column(String(80), nullable=True)
+    blockchain_status = Column(String(20), default="PENDING")
+    blockchain_record_hash = Column(String(66), nullable=True)
+    blockchain_verification_message = Column(String(200), nullable=True)
+    blockchain_verified_at = Column(Float, nullable=True)
     created_at = Column(Float, default=time.time)
 
 
@@ -130,3 +141,52 @@ class FraudCluster(Base):
     fraud_pattern = Column(Text, default="[]")  # JSON-encoded list[str]
     status = Column(String(20), default="ACTIVE")
     created_at = Column(Float, default=time.time)
+
+
+class RECVerificationRequest(Base):
+    """One row per REC Verification Portal check -- every attempt, including
+    failed/NOT_FOUND ones, per the append-only audit requirement. Deliberately
+    NOT cleared by Reset Transactions (see simulator.py's _RESET_TABLES) --
+    a verification/compliance trail should outlive a demo data reset."""
+    __tablename__ = "rec_verification_requests"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    verification_id = Column(String(40), unique=True, index=True, default=lambda: _uuid("VER"))
+    rec_id = Column(String(40), index=True, nullable=False)
+    verifier_company = Column(String(120), nullable=True)
+    verifier_user = Column(String(120), nullable=True)
+    requested_at = Column(Float, default=time.time)
+    result = Column(String(20), nullable=False)  # VALID|SUSPICIOUS|INVALID|TAMPERED|NOT_FOUND|PENDING|UNCONFIRMED
+    reason = Column(Text, default="[]")  # JSON-encoded list[str]
+    blockchain_status = Column(String(20), nullable=True)
+    hash_status = Column(String(20), nullable=True)
+    lifecycle_status = Column(String(20), nullable=True)
+    verified_blockchain = Column(Boolean, default=False)
+    verified_hash = Column(Boolean, default=False)
+    verified_lifecycle = Column(Boolean, default=False)
+    risk_score = Column(Float, nullable=True)
+    source_ip = Column(String(64), nullable=True)
+    # Full computed response captured verbatim at verification time, so the
+    # "Share Verification Report" feature always re-serves exactly what was
+    # decided then -- never recomputed, never editable by the client.
+    result_detail = Column(Text, nullable=True)
+
+
+class RECAuditLog(Base):
+    """Append-only, hash-chained history of everything that happens to a
+    REC. Each row's record_hash covers its own content plus the previous
+    row's hash (see verification_service.audit_log), so silently editing or
+    deleting a row breaks the chain -- a cheap, real tamper-evidence property
+    for what is otherwise a plain SQLite table."""
+    __tablename__ = "rec_audit_log"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    rec_id = Column(String(40), index=True, nullable=False)
+    event_type = Column(String(30), nullable=False)
+    old_value = Column(Text, nullable=True)  # JSON
+    new_value = Column(Text, nullable=True)  # JSON
+    changed_by = Column(String(80), default="system")
+    changed_at = Column(Float, default=time.time)
+    source = Column(String(40), nullable=True)
+    record_hash = Column(String(66), nullable=True)
+    previous_record_hash = Column(String(66), nullable=True)

@@ -13,15 +13,35 @@ import logging
 import random
 import threading
 import time
+import uuid
 
 import config
 import graph_service
 import models
 import pipeline
+import verification_service
 import websocket_service
 from database import SessionLocal
 
 logger = logging.getLogger("simulator")
+
+
+def _new_run_id() -> str:
+    return f"RUN-{uuid.uuid4().hex[:8]}"
+
+
+# Tables cleared by "Reset Transactions", children before parents. Generators
+# (seed config), ML model files, contracts, and everything under backend/chain
+# are deliberately NOT touched -- see Simulator.reset_all's docstring.
+_RESET_TABLES = [
+    models.FraudAlert,
+    models.RECTransaction,
+    models.GraphEdge,
+    models.FraudCluster,
+    models.GraphEntity,
+    models.RECRecord,
+    models.GenerationRecord,
+]
 
 # entities with real seeded Hardhat wallets -- transfers among these actually
 # hit the chain. "Clean" pool entities are off-chain-only strings; the
@@ -154,6 +174,54 @@ def _fraud_dense_cluster(db) -> dict:
     return pipeline.process_transfer(db, rec.rec_id, rec.current_owner, random.choice([a, b]), rec.quantity)
 
 
+def _simulate_tamper(db) -> dict | None:
+    """SYNTHETIC TAMPERING SIMULATION -- demo/test mode only (spec section
+    11). Directly edits energy_generated_mwh/rec_quantity on a copy of an
+    already-issued, ACTIVE REC's rows, exactly like an attacker with raw DB
+    access would -- WITHOUT touching rec.generation_hash or anything on
+    -chain, which is what makes it something the REC Verification Portal
+    can actually catch later. The act of tampering is itself logged (event
+    type REC_UPDATED, source=tamper_simulation, changed_by=SYSTEM_TAMPER_SIM)
+    so it's visible in the audit trail immediately -- but detection (a
+    TAMPER_DETECTED/HASH_MISMATCH audit entry + a CRITICAL fraud alert) only
+    happens the next time someone actually verifies this REC, which is the
+    whole point of the demo."""
+    candidates = db.query(models.RECRecord).filter(
+        models.RECRecord.status == "ACTIVE", models.RECRecord.generation_hash.isnot(None)
+    ).all()
+    if not candidates:
+        return {"skipped": "no eligible ACTIVE RECs with an anchored hash to tamper with"}
+    rec = random.choice(candidates)
+    generation = db.query(models.GenerationRecord).filter_by(generation_id=rec.generation_id).first()
+    if generation is None:
+        return {"skipped": "REC has no linked generation record"}
+
+    old_energy = generation.energy_generated_mwh
+    old_qty = rec.quantity
+    factor = round(random.uniform(1.3, 1.8), 2)
+    generation.energy_generated_mwh = round(old_energy * factor, 2)
+    rec.quantity = round(old_qty * factor, 2)
+    # rec.generation_hash and blockchain data are deliberately left alone.
+
+    verification_service.audit_log(
+        db, rec.rec_id, "REC_UPDATED",
+        old_value={"energy_generated_mwh": old_energy, "rec_quantity": old_qty},
+        new_value={"energy_generated_mwh": generation.energy_generated_mwh, "rec_quantity": rec.quantity},
+        changed_by="SYSTEM_TAMPER_SIM", source="tamper_simulation",
+    )
+    db.commit()
+
+    payload = {
+        "type": "tamper_simulated",
+        "rec_id": rec.rec_id,
+        "old_energy_mwh": old_energy, "new_energy_mwh": generation.energy_generated_mwh,
+        "old_rec_quantity": old_qty, "new_rec_quantity": rec.quantity,
+        "note": "SYNTHETIC TAMPERING SIMULATION -- demo/test mode only, not a real intrusion",
+    }
+    websocket_service.broadcast_sync(payload)
+    return {"skipped": f"tamper-simulated REC {rec.rec_id} ({old_energy}->{generation.energy_generated_mwh} MWh) -- run Verify REC to detect it"}
+
+
 FRAUD_HANDLERS = {
     "OVER_ISSUANCE": _fraud_over_issuance,
     "DUPLICATE_GENERATION": _fraud_duplicate_generation,
@@ -166,39 +234,87 @@ FRAUD_HANDLERS = {
 
 
 class Simulator:
+    """Background tick loop plus the authoritative start/stop/reset/config
+    state machine. All state-changing calls (start/stop/configure/reset_all)
+    go through `self._lock` (a re-entrant lock, since reset_all calls stop
+    from within the same lock) so rapid Start/Stop/Reset clicks from the UI
+    can't interleave into an inconsistent state (e.g. a reset racing a tick
+    that's mid-write)."""
+
     def __init__(self):
         self.interval = config.SIMULATION_INTERVAL_SECONDS
         self.fraud_probability = config.FRAUD_PROBABILITY
+        self.tamper_enabled = False
+        self.tamper_probability = 0.05
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._lock = threading.RLock()
         self.running = False
         self.ticks = 0
+        self.generated_count = 0
+        self.fraud_injected_count = 0
+        self.tamper_injected_count = 0
         self.last_result: dict | None = None
+        self.simulation_run_id = _new_run_id()
 
-    def configure(self, interval_seconds: float | None = None, fraud_probability: float | None = None) -> None:
-        if interval_seconds is not None:
-            self.interval = max(1.0, interval_seconds)
-        if fraud_probability is not None:
-            self.fraud_probability = min(max(fraud_probability, 0.0), 1.0)
+    def configure(self, interval_seconds: float | None = None, fraud_probability: float | None = None,
+                  tamper_enabled: bool | None = None, tamper_probability: float | None = None) -> None:
+        with self._lock:
+            if interval_seconds is not None:
+                self.interval = max(1.0, interval_seconds)
+            if fraud_probability is not None:
+                self.fraud_probability = min(max(fraud_probability, 0.0), 1.0)
+            if tamper_enabled is not None:
+                self.tamper_enabled = bool(tamper_enabled)
+            if tamper_probability is not None:
+                self.tamper_probability = min(max(tamper_probability, 0.0), 1.0)
 
-    def start(self) -> None:
-        if self.running:
-            return
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self.running = True
-        self._thread.start()
-        logger.info("Simulator started (interval=%.1fs, fraud_probability=%.2f)", self.interval, self.fraud_probability)
+    def start(self, interval_seconds: float | None = None, fraud_probability: float | None = None,
+              tamper_enabled: bool | None = None, tamper_probability: float | None = None) -> None:
+        """Optionally applies config first, so "Start Simulation" always uses
+        whatever the user currently has selected -- fixes the bug where the
+        fraud-probability slider only took effect after a separate "Apply"
+        click, so a fresh run silently kept using the previous value."""
+        with self._lock:
+            self.configure(interval_seconds, fraud_probability, tamper_enabled, tamper_probability)
+            if self.running:
+                return
+            self._stop_event.clear()
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self.running = True
+            self._thread.start()
+            logger.info(
+                "Simulator started (run=%s interval=%.1fs, fraud_probability=%.2f)",
+                self.simulation_run_id, self.interval, self.fraud_probability,
+            )
 
-    def stop(self) -> None:
-        self.running = False
-        self._stop_event.set()
-        logger.info("Simulator stopped")
+    def stop(self, wait: bool = False, timeout: float = 20.0) -> None:
+        with self._lock:
+            was_running = self.running
+            self.running = False
+            self._stop_event.set()
+            thread = self._thread
+        if wait and thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+        if was_running:
+            logger.info("Simulator stopped")
 
     def status(self) -> dict:
+        observed_fraud_rate = (
+            round(self.fraud_injected_count / self.generated_count, 4) if self.generated_count else 0.0
+        )
         return {
-            "running": self.running, "interval_seconds": self.interval,
-            "fraud_probability": self.fraud_probability, "ticks": self.ticks,
+            "running": self.running,
+            "interval_seconds": self.interval,
+            "fraud_probability": self.fraud_probability,
+            "tamper_enabled": self.tamper_enabled,
+            "tamper_probability": self.tamper_probability,
+            "ticks": self.ticks,
+            "generated_count": self.generated_count,
+            "fraud_injected_count": self.fraud_injected_count,
+            "tamper_injected_count": self.tamper_injected_count,
+            "observed_fraud_rate": observed_fraud_rate,
+            "simulation_run_id": self.simulation_run_id,
         }
 
     def _run(self) -> None:
@@ -224,7 +340,23 @@ class Simulator:
 
             result["tick"] = self.ticks
             result["is_fraud_injected"] = is_fraud
+            result["simulation_run_id"] = self.simulation_run_id
             self.last_result = result
+
+            if "skipped" not in result:
+                self.generated_count += 1
+                if is_fraud:
+                    self.fraud_injected_count += 1
+
+            # Tampering is independent of the fraud-scenario roll above --
+            # it edits an *already-issued* REC after the fact rather than
+            # generating a new fraudulent event, so it's rolled separately
+            # and doesn't count toward generated_count/fraud_injected_count.
+            if self.tamper_enabled and random.random() < self.tamper_probability:
+                tamper_result = _simulate_tamper(db)
+                if tamper_result:
+                    self.tamper_injected_count += 1
+                    result.setdefault("tamper_simulation", tamper_result)
 
             graph_engine = graph_service.get_engine()
             graph_engine.build(db)
@@ -232,9 +364,77 @@ class Simulator:
             graph_engine.sync_entities_to_db(db)
 
             websocket_service.broadcast_sync({"type": "pipeline_result", "data": result})
+            _broadcast_transaction_created(result)
             return result
         finally:
             db.close()
+
+    def reset_all(self, db) -> dict:
+        """Reset Transactions: stops the simulator (waiting for any in-flight
+        tick to finish first, so we never delete rows out from under a
+        write), clears every simulator-generated table, resets the
+        in-memory graph and this simulator's counters, and starts a fresh
+        `simulation_run_id`.
+
+        Left untouched on purpose: `generators` (seed config, not simulated
+        activity), backend/models/*.pkl (ML models), contracts/ (Solidity
+        source), backend/chain/*.json (deployed contract address/ABI/wallets)
+        and config.py. The local Hardhat chain itself can't be reset without
+        restarting the node -- its old REC entries stay on that immutable
+        ledger, but nothing in the (now-empty) SQLite DB references them
+        anymore, so they never resurface in the UI; see README "Resetting
+        the Simulation" for the full explanation.
+
+        Runs the deletes in one DB transaction: if anything raises partway
+        through, the whole reset rolls back rather than leaving some tables
+        cleared and others not.
+        """
+        with self._lock:
+            self.stop(wait=True)
+            counts: dict[str, int] = {}
+            try:
+                for model in _RESET_TABLES:
+                    counts[model.__tablename__] = db.query(model).count()
+                    db.query(model).delete(synchronize_session=False)
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+
+            graph_service.get_engine().reset()
+            self.ticks = 0
+            self.generated_count = 0
+            self.fraud_injected_count = 0
+            self.tamper_injected_count = 0
+            self.last_result = None
+            self.simulation_run_id = _new_run_id()
+            logger.info("Simulation data reset (new run=%s)", self.simulation_run_id)
+            return counts
+
+
+def _broadcast_transaction_created(result: dict) -> None:
+    """Best-effort second broadcast in the shape the frontend spec calls
+    for, alongside the richer "pipeline_result" event the dashboard already
+    consumes -- additive only, never required for the UI to function."""
+    if "skipped" in result or "error" in result:
+        return
+    rec = result.get("rec") or {}
+    tx = result.get("transaction") or {}
+    decision = result.get("decision") or {}
+    ml = result.get("ml") or {}
+    graph = result.get("graph") or {}
+    websocket_service.broadcast_sync({
+        "type": "transaction_created",
+        "transaction_id": tx.get("transaction_id"),
+        "rec_id": rec.get("rec_id") or tx.get("rec_id"),
+        "ml_score": ml.get("ml_score"),
+        "graph_score": graph.get("graph_score"),
+        "final_risk_score": decision.get("final_risk_score"),
+        "risk_level": decision.get("risk_level"),
+        "blockchain_status": rec.get("blockchain_status") or tx.get("blockchain_status"),
+        "blockchain_tx_hash": rec.get("blockchain_tx_hash") or tx.get("blockchain_tx_hash"),
+        "fraud_type": result.get("injected_scenario") if result.get("is_fraud_injected") else None,
+    })
 
 
 _simulator = Simulator()

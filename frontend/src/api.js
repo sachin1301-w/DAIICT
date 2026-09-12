@@ -40,10 +40,29 @@ export const api = {
   blockchainStatus: () => request("/api/blockchain/status"),
   verifyRec: (recId) => request(`/api/verify/${recId}`),
 
-  simulationStart: () => request("/api/simulation/start", { method: "POST" }),
+  // REC Verification Portal
+  getRec: (recId) => request(`/api/rec/${recId}`),
+  verifyRecPortal: (recId, payload) =>
+    request(`/api/rec/${recId}/verify`, { method: "POST", body: JSON.stringify(payload || {}) }),
+  recAuditHistory: (recId) => request(`/api/rec/${recId}/history`),
+  recVerificationHistory: (recId) => request(`/api/rec/${recId}/verification-history`),
+  verificationHistory: (params) => {
+    const qs = new URLSearchParams(Object.entries(params || {}).filter(([, v]) => v !== undefined && v !== ""));
+    const s = qs.toString();
+    return request(`/api/verification/history${s ? `?${s}` : ""}`);
+  },
+  getVerification: (verificationId) => request(`/api/verification/${verificationId}`),
+  verificationReport: (verificationId) =>
+    request("/api/verification/report", { method: "POST", body: JSON.stringify({ verification_id: verificationId }) }),
+
+  // `config` is optional -- when passed, the backend applies it before
+  // starting, so the currently-selected fraud probability/interval always
+  // takes effect immediately on a fresh run.
+  simulationStart: (config) => request("/api/simulation/start", { method: "POST", body: JSON.stringify(config || {}) }),
   simulationStop: () => request("/api/simulation/stop", { method: "POST" }),
   simulationStatus: () => request("/api/simulation/status"),
   simulationConfig: (payload) => request("/api/simulation/config", { method: "POST", body: JSON.stringify(payload) }),
+  simulationReset: () => request("/api/simulation/reset", { method: "POST" }),
 
   submitGeneration: (payload) => request("/api/generation", { method: "POST", body: JSON.stringify(payload) }),
   submitTransfer: (payload) => request("/api/transactions/transfer", { method: "POST", body: JSON.stringify(payload) }),

@@ -1,10 +1,23 @@
 import React, { useEffect, useRef, useState } from "react";
 import { api } from "../api.js";
 
-export default function NetworkGraph({ focusEntities, onClearFocus }) {
+export default function NetworkGraph({ focusEntities, onClearFocus, resetEpoch = 0 }) {
   const containerRef = useRef(null);
   const networkRef = useRef(null);
   const [stats, setStats] = useState({ nodes: 0, edges: 0 });
+  const [loaded, setLoaded] = useState(false);
+
+  // A reset clears the backend instantly, so drop any graph we're currently
+  // showing right away rather than waiting for the next poll -- avoids a
+  // brief flash of the previous run's now-deleted nodes/edges.
+  useEffect(() => {
+    if (resetEpoch > 0) {
+      networkRef.current?.destroy();
+      networkRef.current = null;
+      setStats({ nodes: 0, edges: 0 });
+      setLoaded(false);
+    }
+  }, [resetEpoch]);
 
   useEffect(() => {
     let cancelled = false;
@@ -12,12 +25,23 @@ export default function NetworkGraph({ focusEntities, onClearFocus }) {
 
     async function load() {
       const data = await api.networkGraph();
-      if (cancelled || !containerRef.current || !window.vis) return;
+      if (cancelled) return;
 
       const visibleNodes = focusSet ? data.nodes.filter((n) => focusSet.has(n.id)) : data.nodes;
       const visibleEdges = focusSet
         ? data.edges.filter((e) => focusSet.has(e.from) && focusSet.has(e.to))
         : data.edges;
+
+      setStats({ nodes: visibleNodes.length, edges: visibleEdges.length });
+      setLoaded(true);
+
+      if (!containerRef.current || !window.vis) return;
+
+      if (networkRef.current) networkRef.current.destroy();
+      if (visibleNodes.length === 0) {
+        networkRef.current = null;
+        return;
+      }
 
       const nodes = new window.vis.DataSet(
         visibleNodes.map((n) => ({
@@ -27,9 +51,7 @@ export default function NetworkGraph({ focusEntities, onClearFocus }) {
         }))
       );
       const edges = new window.vis.DataSet(visibleEdges);
-      setStats({ nodes: visibleNodes.length, edges: visibleEdges.length });
 
-      if (networkRef.current) networkRef.current.destroy();
       networkRef.current = new window.vis.Network(
         containerRef.current,
         { nodes, edges },
@@ -48,7 +70,7 @@ export default function NetworkGraph({ focusEntities, onClearFocus }) {
       clearInterval(id);
       networkRef.current?.destroy();
     };
-  }, [focusEntities]);
+  }, [focusEntities, resetEpoch]);
 
   return (
     <div>
@@ -70,7 +92,14 @@ export default function NetworkGraph({ focusEntities, onClearFocus }) {
           &larr; Show full network
         </button>
       )}
-      <div ref={containerRef} className="h-[520px] bg-slate-900 border border-slate-800 rounded-xl" />
+      <div className="relative h-[520px] bg-slate-900 border border-slate-800 rounded-xl">
+        <div ref={containerRef} className="absolute inset-0" />
+        {loaded && stats.nodes === 0 && (
+          <div className="absolute inset-0 flex items-center justify-center text-center text-slate-500 text-sm px-6">
+            No transactions available. Start the simulation to build the graph.
+          </div>
+        )}
+      </div>
     </div>
   );
 }

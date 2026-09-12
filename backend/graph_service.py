@@ -59,6 +59,15 @@ class GraphFraudEngine:
 
     # ---------------- build ----------------
 
+    def reset(self) -> None:
+        """Drop all in-memory graph state. `build()` already rebuilds the
+        graph from scratch on every call (see module docstring), so this is
+        mostly belt-and-braces for the moment right after a data reset,
+        before anything has called build() again -- callers that read
+        `self.graph` directly (rather than through build()) still see an
+        empty graph instead of the previous run's stale state."""
+        self.graph = nx.MultiDiGraph()
+
     def build(self, db: Session) -> None:
         self.graph = nx.MultiDiGraph()
         transactions = db.query(models.RECTransaction).order_by(models.RECTransaction.transaction_timestamp).all()

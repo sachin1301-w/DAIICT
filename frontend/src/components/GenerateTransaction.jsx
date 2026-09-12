@@ -1,34 +1,16 @@
 import React, { useEffect, useState } from "react";
 import { api } from "../api.js";
+import SimulationControls from "./SimulationControls.jsx";
 
-export default function GenerateTransaction() {
-  const [status, setStatus] = useState(null);
-  const [interval, setIntervalValue] = useState(5);
-  const [fraudProb, setFraudProb] = useState(15);
+export default function GenerateTransaction({ resetEpoch }) {
   const [generators, setGenerators] = useState([]);
   const [form, setForm] = useState({ generator_id: "", energy_generated_mwh: 40, weather_factor: 0.85, rec_quantity: "" });
   const [result, setResult] = useState(null);
   const [busy, setBusy] = useState(false);
 
-  function refreshStatus() {
-    api.simulationStatus().then((s) => {
-      setStatus(s);
-      setIntervalValue(s.interval_seconds);
-      setFraudProb(Math.round(s.fraud_probability * 100));
-    });
-  }
-
   useEffect(() => {
-    refreshStatus();
     api.generators().then(setGenerators);
-    const id = setInterval(refreshStatus, 4000);
-    return () => clearInterval(id);
   }, []);
-
-  async function applyConfig() {
-    await api.simulationConfig({ interval_seconds: Number(interval), fraud_probability: fraudProb / 100 });
-    refreshStatus();
-  }
 
   async function submitGeneration(e) {
     e.preventDefault();
@@ -59,57 +41,7 @@ export default function GenerateTransaction() {
       </p>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
-          <h3 className="text-xs uppercase tracking-wide text-slate-400 mb-4">Background Simulator</h3>
-          <div className="flex items-center gap-3 mb-4">
-            <span className={`badge ${status?.running ? "bg-emerald-900/40 text-emerald-400" : "bg-slate-800 text-slate-400"}`}>
-              {status?.running ? "RUNNING" : "STOPPED"}
-            </span>
-            <span className="text-xs text-slate-500">{status?.ticks ?? 0} ticks so far</span>
-          </div>
-
-          <div className="space-y-3 mb-4">
-            <label className="block text-xs text-slate-400">
-              Interval (seconds)
-              <input
-                type="number"
-                min="1"
-                value={interval}
-                onChange={(e) => setIntervalValue(e.target.value)}
-                className="mt-1 w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-sm"
-              />
-            </label>
-            <label className="block text-xs text-slate-400">
-              Fraud probability: {fraudProb}%
-              <input
-                type="range"
-                min="0"
-                max="60"
-                value={fraudProb}
-                onChange={(e) => setFraudProb(Number(e.target.value))}
-                className="mt-1 w-full"
-              />
-            </label>
-            <button onClick={applyConfig} className="text-xs text-emerald-400 hover:underline">
-              Apply config
-            </button>
-          </div>
-
-          <div className="flex gap-2">
-            <button
-              onClick={() => api.simulationStart().then(refreshStatus)}
-              className="flex-1 bg-emerald-700 hover:bg-emerald-600 rounded-lg py-2 text-sm font-medium"
-            >
-              Start
-            </button>
-            <button
-              onClick={() => api.simulationStop().then(refreshStatus)}
-              className="flex-1 bg-slate-800 hover:bg-slate-700 rounded-lg py-2 text-sm font-medium"
-            >
-              Stop
-            </button>
-          </div>
-        </div>
+        <SimulationControls resetEpoch={resetEpoch} />
 
         <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
           <h3 className="text-xs uppercase tracking-wide text-slate-400 mb-4">Submit a Generation Reading</h3>

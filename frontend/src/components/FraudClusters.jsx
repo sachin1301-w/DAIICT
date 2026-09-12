@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { api } from "../api.js";
 
-export default function FraudClusters({ onOpenGraph }) {
+export default function FraudClusters({ onOpenGraph, resetEpoch = 0 }) {
   const [clusters, setClusters] = useState([]);
 
   useEffect(() => {
@@ -9,7 +9,7 @@ export default function FraudClusters({ onOpenGraph }) {
     load();
     const id = setInterval(load, 6000);
     return () => clearInterval(id);
-  }, []);
+  }, [resetEpoch]);
 
   return (
     <div>

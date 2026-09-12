@@ -32,6 +32,7 @@ import graph_service
 import models
 import ml_service
 import rules_engine
+import verification_service
 from blockchain_service import get_service as get_chain
 
 logger = logging.getLogger("pipeline")
@@ -40,6 +41,36 @@ logger = logging.getLogger("pipeline")
 def _hash_payload(payload: dict) -> str:
     blob = json.dumps(payload, sort_keys=True, default=str).encode()
     return hashlib.sha256(blob).hexdigest()
+
+
+def _blockchain_settlement(chain, chain_result, rec_id: str | None = None,
+                            expected_hash: str | None = None) -> tuple[str, str]:
+    """Classifies a raw blockchain_service.TxResult into the four statuses
+    the dashboard shows: PASSED / FAILED / PENDING / NOT_CONNECTED.
+
+    NOT_CONNECTED means specifically "the local Hardhat node was
+    unreachable" -- it is never used to mean "passed" or "failed" by
+    default. A real on-chain rejection, or a hash that doesn't match once
+    read back, is always FAILED, so the app never marks something PASSED
+    merely because the blockchain service happened to be unavailable.
+
+    When `expected_hash` is given (REC issuance), this also reads the
+    record back from chain and compares hashes -- that's the actual
+    tamper-detection check, not just "did the transaction get mined."
+    """
+    if chain_result.pending_sync:
+        return "NOT_CONNECTED", "Local blockchain node unavailable"
+    if not chain_result.ok:
+        return "FAILED", chain_result.error or "Blockchain transaction rejected"
+    if rec_id and expected_hash:
+        onchain = chain.verify_rec(rec_id)
+        if onchain is None:
+            return "PENDING", "Transaction submitted; not yet confirmed on-chain"
+        onchain_hash = onchain["generation_data_hash"]
+        if onchain_hash == expected_hash or onchain_hash.lstrip("0") == expected_hash.lstrip("0"):
+            return "PASSED", "Hash verified successfully"
+        return "FAILED", "On-chain hash does not match off-chain record"
+    return "PASSED", "Blockchain transaction confirmed"
 
 
 def _counterparties_last_24h(db: Session, entity: str) -> int:
@@ -217,7 +248,6 @@ def process_generation_event(db: Session, generator_id: str, energy_generated_mw
     rec = models.RECRecord(
         generation_id=generation.generation_id, generator_id=generator_id, quantity=rec_quantity,
         issue_timestamp=now, current_owner=generator.wallet_address or generator_id,
-        generation_hash=data_hash,
     )
 
     chain = get_chain()
@@ -225,25 +255,52 @@ def process_generation_event(db: Session, generator_id: str, energy_generated_mw
         rec.status = "ACTIVE"
         db.add(rec)
         db.flush()
-        db.add(models.RECTransaction(
+        # Canonical, verification_service-shared hash -- needs rec.rec_id,
+        # which only exists after the flush above. This is the hash anchored
+        # on-chain and checked by every later REC Verification Portal call
+        # (see verification_service.canonical_rec_hash's docstring).
+        canonical_hash = verification_service.canonical_rec_hash(rec, generation, generator)
+        rec.generation_hash = canonical_hash
+        tx_row = models.RECTransaction(
             rec_id=rec.rec_id, sender=None, receiver=rec.current_owner,
             transaction_type="ISSUE", quantity=rec_quantity, transaction_timestamp=now,
-        ))
+        )
+        db.add(tx_row)
         db.add(models.GraphEdge(
             source_entity="ISSUANCE", target_entity=rec.current_owner, relationship_type="ISSUED",
             rec_id=rec.rec_id, quantity=rec_quantity, transaction_timestamp=now,
         ))
-        chain_result = chain.issue_rec(rec.rec_id, generator_id, rec_quantity, _resolve_address(rec.current_owner), data_hash)
-        rec.blockchain_tx_hash = chain_result.tx_hash
+        chain_result = chain.issue_rec(rec.rec_id, generator_id, rec_quantity, _resolve_address(rec.current_owner), canonical_hash)
+        status, message = _blockchain_settlement(chain, chain_result, rec_id=rec.rec_id, expected_hash=canonical_hash)
+        for row in (rec, tx_row):
+            row.blockchain_tx_hash = chain_result.tx_hash
+            row.blockchain_status = status
+            row.blockchain_record_hash = canonical_hash
+            row.blockchain_verification_message = message
+            row.blockchain_verified_at = now
         if not chain_result.ok:
             logger.warning("blockchain issue_rec failed/pending for %s: %s", rec.rec_id, chain_result.error)
+        verification_service.audit_log(
+            db, rec.rec_id, "REC_CREATED",
+            new_value={"energy_generated_mwh": energy_generated_mwh, "rec_quantity": rec_quantity, "status": rec.status},
+            changed_by=generator_id, source="pipeline",
+        )
     else:
         # step 12/13: hold, never auto-revoke
         rec.status = "HELD"
+        rec.blockchain_status = "PENDING"
+        rec.blockchain_verification_message = "Held for fraud review, not yet submitted to blockchain"
+        rec.blockchain_verified_at = now
         db.add(rec)
         db.flush()
+        rec.generation_hash = verification_service.canonical_rec_hash(rec, generation, generator)
         fraud_type = _infer_fraud_type(decision, rules_result["violations"])
         _create_alert(db, decision, rec.rec_id, generation.generation_id, None, fraud_type)
+        verification_service.audit_log(
+            db, rec.rec_id, "REC_CREATED",
+            new_value={"energy_generated_mwh": energy_generated_mwh, "rec_quantity": rec_quantity, "status": rec.status},
+            changed_by=generator_id, source="pipeline",
+        )
 
     db.commit()
 
@@ -319,16 +376,47 @@ def process_transfer(db: Session, rec_id: str, sender: str, receiver: str, quant
             rec_id=rec_id, quantity=quantity, transaction_timestamp=now,
         ))
         chain_result = chain.transfer_rec(rec_id, _label_for(sender), _resolve_address(receiver))
+        status, message = _blockchain_settlement(chain, chain_result)
         transaction.blockchain_tx_hash = chain_result.tx_hash
+        transaction.blockchain_status = status
+        transaction.blockchain_verification_message = message
+        transaction.blockchain_verified_at = now
+        rec.blockchain_status = status
+        rec.blockchain_verification_message = message
+        rec.blockchain_verified_at = now
         db.flush()
+        verification_service.audit_log(
+            db, rec_id, "REC_TRANSFERRED", old_value={"owner": sender}, new_value={"owner": receiver},
+            changed_by=sender, source="pipeline",
+        )
     else:
         fraud_type = _infer_fraud_type(decision, rules_result["violations"])
         db.add(transaction)
         db.flush()
         _create_alert(db, decision, rec_id, rec.generation_id, transaction.transaction_id, fraud_type)
         if decision["decision"] == "CRITICAL":
-            chain.freeze_rec(rec_id)
+            freeze_result = chain.freeze_rec(rec_id)
             rec.status = "HELD"
+            if freeze_result.pending_sync:
+                status, message = "NOT_CONNECTED", "Local blockchain node unavailable"
+            else:
+                status, message = "FAILED", "Blockchain integrity check failed -- on-chain hash does not match off-chain record"
+                transaction.blockchain_tx_hash = freeze_result.tx_hash
+            transaction.blockchain_status = status
+            transaction.blockchain_verification_message = message
+            transaction.blockchain_verified_at = now
+            rec.blockchain_status = status
+            rec.blockchain_verification_message = message
+            rec.blockchain_verified_at = now
+            verification_service.audit_log(
+                db, rec_id, "HASH_MISMATCH", old_value={"expected_hash": rec.generation_hash},
+                new_value={"onchain_hash": onchain["generation_data_hash"] if onchain else None},
+                changed_by="pipeline", source="pipeline",
+            )
+        else:
+            transaction.blockchain_status = "PENDING"
+            transaction.blockchain_verification_message = "Held pending fraud review, not synchronized to blockchain"
+            transaction.blockchain_verified_at = now
 
     db.commit()
 
@@ -356,9 +444,22 @@ def retire_rec(db: Session, rec_id: str, owner: str) -> dict:
         rec_id=rec_id, sender=owner, receiver=None, transaction_type="RETIRE",
         quantity=rec.quantity, transaction_timestamp=now,
     )
-    chain_result = get_chain().retire_rec(rec_id, _label_for(owner))
+    chain = get_chain()
+    chain_result = chain.retire_rec(rec_id, _label_for(owner))
+    status, message = _blockchain_settlement(chain, chain_result)
     transaction.blockchain_tx_hash = chain_result.tx_hash
+    transaction.blockchain_status = status
+    transaction.blockchain_verification_message = message
+    transaction.blockchain_verified_at = now
+    rec.blockchain_status = status
+    rec.blockchain_verification_message = message
+    rec.blockchain_verified_at = now
     db.add(transaction)
+    db.flush()
+    verification_service.audit_log(
+        db, rec_id, "REC_RETIRED", old_value={"status": "ACTIVE"}, new_value={"status": "RETIRED"},
+        changed_by=owner, source="pipeline",
+    )
     db.commit()
 
     logger.info("[%s] retire=%s rec=%s owner=%s", time.strftime("%H:%M:%S"), transaction.transaction_id, rec_id, owner)
@@ -377,14 +478,27 @@ def revoke_rec(db: Session, rec_id: str, reason: str) -> dict:
         rec_id=rec_id, sender="REGULATOR", receiver=None, transaction_type="REVOKE",
         quantity=rec.quantity, transaction_timestamp=now,
     )
-    chain_result = get_chain().revoke_rec(rec_id, reason)
+    chain = get_chain()
+    chain_result = chain.revoke_rec(rec_id, reason)
+    status, message = _blockchain_settlement(chain, chain_result)
     transaction.blockchain_tx_hash = chain_result.tx_hash
+    transaction.blockchain_status = status
+    transaction.blockchain_verification_message = message
+    transaction.blockchain_verified_at = now
+    rec.blockchain_status = status
+    rec.blockchain_verification_message = message
+    rec.blockchain_verified_at = now
     db.add(transaction)
 
     alert = db.query(models.FraudAlert).filter_by(rec_id=rec_id, status="OPEN").first()
     if alert:
         alert.status = "RESOLVED"
 
+    db.flush()
+    verification_service.audit_log(
+        db, rec_id, "REC_REVOKED", old_value={"status": "ACTIVE"}, new_value={"status": "REVOKED", "reason": reason},
+        changed_by="REGULATOR", source="pipeline",
+    )
     db.commit()
 
     logger.info(

@@ -6,6 +6,8 @@ import FraudClusters from "./components/FraudClusters.jsx";
 import NetworkGraph from "./components/NetworkGraph.jsx";
 import GenerateTransaction from "./components/GenerateTransaction.jsx";
 import QRVerification from "./components/QRVerification.jsx";
+import RecVerification from "./components/RecVerification.jsx";
+import VerificationHistory from "./components/VerificationHistory.jsx";
 import { api, connectLiveFeed } from "./api.js";
 
 const NAV = [
@@ -15,6 +17,8 @@ const NAV = [
   { id: "clusters", label: "Fraud Clusters" },
   { id: "graph", label: "Network Graph" },
   { id: "simulation", label: "Simulation Control" },
+  { id: "recverify", label: "Verify REC" },
+  { id: "verhistory", label: "Verification History" },
   { id: "verify", label: "Blockchain Verify" },
 ];
 
@@ -32,6 +36,22 @@ export default function App() {
   const [feed, setFeed] = useState([]);
   const [chainStatus, setChainStatus] = useState(null);
   const [graphFocus, setGraphFocus] = useState(null);
+  // Bumped on every "simulation_reset" broadcast. Passed down as a prop so
+  // every live view (Dashboard, graph, alerts, clusters, certificates)
+  // refetches immediately instead of waiting out its normal poll interval.
+  const [resetEpoch, setResetEpoch] = useState(0);
+  const [resetBanner, setResetBanner] = useState(false);
+  // Bumped on every "rec_verified" broadcast so Dashboard's Verification
+  // Summary card and the Verification History page refresh immediately --
+  // separate from resetEpoch since a verification never clears anything.
+  const [verificationEpoch, setVerificationEpoch] = useState(0);
+  const [toasts, setToasts] = useState([]);
+
+  function pushToast(toast) {
+    const id = Math.random().toString(36).slice(2);
+    setToasts((prev) => [...prev, { id, ...toast }]);
+    setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 6000);
+  }
 
   function openClusterGraph(entityIds) {
     setGraphFocus(entityIds);
@@ -42,6 +62,22 @@ export default function App() {
     const disconnect = connectLiveFeed((msg) => {
       if (msg.type === "pipeline_result") {
         setFeed((prev) => [msg.data, ...prev].slice(0, 60));
+      } else if (msg.type === "simulation_reset") {
+        setFeed([]);
+        setGraphFocus(null);
+        setResetEpoch((e) => e + 1);
+        setResetBanner(true);
+        setTimeout(() => setResetBanner(false), 4000);
+      } else if (msg.type === "rec_verified") {
+        setVerificationEpoch((e) => e + 1);
+        pushToast({
+          tone: msg.result === "TAMPERED" ? "danger" : msg.result === "VALID" ? "ok" : "warn",
+          text: `${msg.rec_id} verified: ${msg.result}`,
+        });
+      } else if (msg.type === "tamper_detected") {
+        pushToast({ tone: "danger", text: `TAMPER DETECTED on ${msg.rec_id}: ${msg.reason}` });
+      } else if (msg.type === "tamper_simulated") {
+        pushToast({ tone: "warn", text: `[demo] Simulated tampering on ${msg.rec_id} -- run Verify REC to catch it` });
       }
     });
     return disconnect;
@@ -87,14 +123,40 @@ export default function App() {
       </aside>
 
       <main className="flex-1 p-8 overflow-y-auto max-h-screen">
-        {view === "dashboard" && <Dashboard feed={feed} />}
-        {view === "certificates" && <CertificateTable />}
-        {view === "alerts" && <FraudAlerts />}
-        {view === "clusters" && <FraudClusters onOpenGraph={openClusterGraph} />}
-        {view === "graph" && <NetworkGraph focusEntities={graphFocus} onClearFocus={() => setGraphFocus(null)} />}
-        {view === "simulation" && <GenerateTransaction />}
+        {resetBanner && (
+          <div className="mb-4 text-xs bg-emerald-950/40 border border-emerald-900 text-emerald-400 rounded-lg px-3 py-2">
+            Simulation data reset -- all transactions, alerts and graph data cleared.
+          </div>
+        )}
+        {view === "dashboard" && <Dashboard feed={feed} resetEpoch={resetEpoch + verificationEpoch} />}
+        {view === "certificates" && <CertificateTable resetEpoch={resetEpoch} />}
+        {view === "alerts" && <FraudAlerts resetEpoch={resetEpoch} />}
+        {view === "clusters" && <FraudClusters onOpenGraph={openClusterGraph} resetEpoch={resetEpoch} />}
+        {view === "graph" && (
+          <NetworkGraph focusEntities={graphFocus} onClearFocus={() => setGraphFocus(null)} resetEpoch={resetEpoch} />
+        )}
+        {view === "simulation" && <GenerateTransaction resetEpoch={resetEpoch} />}
+        {view === "recverify" && <RecVerification resetEpoch={resetEpoch} />}
+        {view === "verhistory" && <VerificationHistory resetEpoch={verificationEpoch} />}
         {view === "verify" && <QRVerification initialRecId={initialRecIdFromUrl()} />}
       </main>
+
+      <div className="fixed bottom-4 right-4 flex flex-col gap-2 z-50 w-80">
+        {toasts.map((t) => (
+          <div
+            key={t.id}
+            className={`text-xs rounded-lg px-3 py-2 shadow-lg border ${
+              t.tone === "danger"
+                ? "bg-red-950/90 border-red-800 text-red-200"
+                : t.tone === "ok"
+                ? "bg-emerald-950/90 border-emerald-800 text-emerald-200"
+                : "bg-amber-950/90 border-amber-800 text-amber-200"
+            }`}
+          >
+            {t.text}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

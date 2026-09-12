@@ -3,18 +3,29 @@ from __future__ import annotations
 import json
 import time
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 import models
 import pipeline
 import schemas
+import verification_service
+import websocket_service
 from blockchain_service import get_service as get_chain
 from database import get_db
 from graph_service import get_engine as get_graph_engine
 from simulator import get_simulator
 
 router = APIRouter(prefix="/api")
+
+_MAX_REC_ID_LEN = 60
+
+
+def _validate_rec_id(rec_id: str) -> str:
+    if not rec_id or len(rec_id) > _MAX_REC_ID_LEN or not all(c.isalnum() or c in "-_" for c in rec_id):
+        raise HTTPException(400, "invalid rec_id")
+    return rec_id
 
 
 def _alert_dict(a: models.FraudAlert) -> dict:
@@ -49,6 +60,43 @@ def dashboard_summary(db: Session = Depends(get_db)):
     suspicious_tx = len({a.transaction_id for a in alerts if a.transaction_id})
     avg_risk = round(sum(a.final_risk_score for a in alerts) / len(alerts), 2) if alerts else 0.0
 
+    # Blockchain verification card: counted off rec_transactions so it reads
+    # zero right after a reset, same as everything else on this page.
+    status_rows = db.query(models.RECTransaction.blockchain_status, func.count(models.RECTransaction.id)) \
+        .group_by(models.RECTransaction.blockchain_status).all()
+    status_counts = {(status or "PENDING"): count for status, count in status_rows}
+    blockchain_verification = {
+        "passed": status_counts.get("PASSED", 0),
+        "failed": status_counts.get("FAILED", 0),
+        "pending": status_counts.get("PENDING", 0),
+        "not_connected": status_counts.get("NOT_CONNECTED", 0),
+    }
+
+    # Verification Portal summary card (section 14). Deliberately NOT scoped
+    # to rec_transactions/the current simulation run -- verification
+    # requests survive Reset Transactions (see simulator._RESET_TABLES), so
+    # this reflects the full compliance history, not just the live demo run.
+    ver_result_rows = db.query(models.RECVerificationRequest.result, func.count(models.RECVerificationRequest.id)) \
+        .group_by(models.RECVerificationRequest.result).all()
+    ver_result_counts = {r: c for r, c in ver_result_rows}
+    ver_bc_rows = db.query(models.RECVerificationRequest.blockchain_status, func.count(models.RECVerificationRequest.id)) \
+        .group_by(models.RECVerificationRequest.blockchain_status).all()
+    ver_bc_counts = {(s or "PENDING"): c for s, c in ver_bc_rows}
+    verification_summary = {
+        "total": sum(ver_result_counts.values()),
+        "valid": ver_result_counts.get("VALID", 0),
+        "suspicious": ver_result_counts.get("SUSPICIOUS", 0),
+        "tampered": ver_result_counts.get("TAMPERED", 0),
+        "not_found": ver_result_counts.get("NOT_FOUND", 0),
+        "pending": ver_result_counts.get("PENDING", 0),
+        "unconfirmed": ver_result_counts.get("UNCONFIRMED", 0),
+        "invalid": ver_result_counts.get("INVALID", 0),
+        "blockchain_passed": ver_bc_counts.get("PASSED", 0),
+        "blockchain_failed": ver_bc_counts.get("FAILED", 0),
+        "blockchain_pending": ver_bc_counts.get("PENDING", 0),
+        "blockchain_not_connected": ver_bc_counts.get("NOT_CONNECTED", 0),
+    }
+
     return {
         "total_generators": total_generators,
         "total_recs_issued": total_recs,
@@ -59,6 +107,8 @@ def dashboard_summary(db: Session = Depends(get_db)):
         "fraud_alerts": len(alerts),
         "open_fraud_alerts": len([a for a in alerts if a.status == "OPEN"]),
         "average_risk_score": avg_risk,
+        "blockchain_verification": blockchain_verification,
+        "verification_summary": verification_summary,
         "simulation": get_simulator().status(),
         "blockchain": get_chain().status(),
     }
@@ -201,12 +251,165 @@ def verify_rec(rec_id: str, db: Session = Depends(get_db)):
     return {"rec": _rec_dict(rec), "onchain": onchain, "hash_verification": hash_check, "lifecycle": lifecycle}
 
 
+# ---------------------------------------------------------------- REC Verification Portal
+#
+# Distinct from the QR-code deep-link `/verify/{rec_id}` route above (which
+# just shows a basic hash/lifecycle check for the Blockchain Verify page):
+# this is the full tamper-detection flow -- GET is a read-only lookup with
+# no side effects, POST .../verify is the audited event that writes an
+# append-only rec_verification_requests row (every attempt, including
+# NOT_FOUND) and, when tampering is confirmed, a real FraudAlert + audit-log
+# entry. See verification_service.py for the actual checks.
+
+@router.get("/rec/{rec_id}")
+def get_rec(rec_id: str, db: Session = Depends(get_db)):
+    _validate_rec_id(rec_id)
+    detail = verification_service.get_rec_detail(db, rec_id)
+    if detail is None:
+        raise HTTPException(404, "REC not found")
+    return detail
+
+
+@router.post("/rec/{rec_id}/verify")
+def verify_rec_portal(rec_id: str, payload: schemas.VerifyRecRequest | None = Body(default=None),
+                       db: Session = Depends(get_db)):
+    _validate_rec_id(rec_id)
+    company = payload.verifier_company if payload else None
+    user = payload.verifier_user if payload else None
+    result = verification_service.verify_rec(db, rec_id, verifier_company=company, verifier_user=user)
+
+    websocket_service.broadcast_sync({
+        "type": "rec_verified",
+        "rec_id": rec_id,
+        "verification_id": result["verification_id"],
+        "result": result["result"],
+        "blockchain_status": result["blockchain_status"],
+        "hash_status": result["hash_status"],
+    })
+    if result["result"] == "TAMPERED":
+        websocket_service.broadcast_sync({
+            "type": "tamper_detected",
+            "rec_id": rec_id,
+            "verification_id": result["verification_id"],
+            "result": "TAMPERED",
+            "severity": "CRITICAL",
+            "reason": result["reasons"][0] if result["reasons"] else "Data integrity check failed",
+        })
+    return result
+
+
+@router.get("/rec/{rec_id}/history")
+def rec_history(rec_id: str, db: Session = Depends(get_db)):
+    _validate_rec_id(rec_id)
+    rows = db.query(models.RECAuditLog).filter_by(rec_id=rec_id).order_by(models.RECAuditLog.changed_at).all()
+    return [
+        {
+            "id": r.id, "rec_id": r.rec_id, "event_type": r.event_type,
+            "old_value": json.loads(r.old_value) if r.old_value else None,
+            "new_value": json.loads(r.new_value) if r.new_value else None,
+            "changed_by": r.changed_by, "changed_at": r.changed_at, "source": r.source,
+            "record_hash": r.record_hash, "previous_record_hash": r.previous_record_hash,
+        }
+        for r in rows
+    ]
+
+
+@router.get("/rec/{rec_id}/verification-history")
+def rec_verification_history(rec_id: str, db: Session = Depends(get_db)):
+    _validate_rec_id(rec_id)
+    rows = db.query(models.RECVerificationRequest).filter_by(rec_id=rec_id) \
+        .order_by(models.RECVerificationRequest.requested_at.desc()).all()
+    return [_verification_dict(r) for r in rows]
+
+
+@router.get("/verification/history")
+def verification_history(
+    rec_id: str | None = None, company: str | None = None, result: str | None = None,
+    blockchain_status: str | None = None, since: float | None = None, until: float | None = None,
+    limit: int = 200, db: Session = Depends(get_db),
+):
+    """Global listing (Verification History page) -- filterable, unlike the
+    per-REC .../verification-history above."""
+    q = db.query(models.RECVerificationRequest)
+    if rec_id:
+        q = q.filter(models.RECVerificationRequest.rec_id == rec_id)
+    if company:
+        q = q.filter(models.RECVerificationRequest.verifier_company.ilike(f"%{company}%"))
+    if result:
+        q = q.filter(models.RECVerificationRequest.result == result.upper())
+    if blockchain_status:
+        q = q.filter(models.RECVerificationRequest.blockchain_status == blockchain_status.upper())
+    if since is not None:
+        q = q.filter(models.RECVerificationRequest.requested_at >= since)
+    if until is not None:
+        q = q.filter(models.RECVerificationRequest.requested_at <= until)
+    rows = q.order_by(models.RECVerificationRequest.requested_at.desc()).limit(min(limit, 1000)).all()
+    return [_verification_dict(r) for r in rows]
+
+
+@router.get("/verification/{verification_id}")
+def get_verification(verification_id: str, db: Session = Depends(get_db)):
+    row = db.query(models.RECVerificationRequest).filter_by(verification_id=verification_id).first()
+    if not row:
+        raise HTTPException(404, "verification not found")
+    return _verification_dict(row, include_detail=True)
+
+
+@router.post("/verification/report")
+def verification_report(payload: schemas.VerificationReportRequest, db: Session = Depends(get_db)):
+    """Generates the "Share Verification Report" download. Takes only a
+    verification_id -- the result itself is never accepted from the client,
+    only re-served from what was actually decided and stored at
+    verification time (result_detail), so it can't be edited into showing
+    something that didn't happen."""
+    row = db.query(models.RECVerificationRequest).filter_by(verification_id=payload.verification_id).first()
+    if not row:
+        raise HTTPException(404, "verification not found")
+    detail = json.loads(row.result_detail) if row.result_detail else {}
+    return {
+        "verification_id": row.verification_id,
+        "rec_id": row.rec_id,
+        "generated_at": time.time(),
+        "verifier_company": row.verifier_company,
+        "verifier_user": row.verifier_user,
+        "verification_timestamp": row.requested_at,
+        "result": row.result,
+        "blockchain_status": row.blockchain_status,
+        "hash_status": row.hash_status,
+        "lifecycle_status": row.lifecycle_status,
+        "risk_score": row.risk_score,
+        "reasons": json.loads(row.reason or "[]"),
+        "detail": detail,
+    }
+
+
+def _verification_dict(r: models.RECVerificationRequest, include_detail: bool = False) -> dict:
+    d = {
+        "verification_id": r.verification_id, "rec_id": r.rec_id,
+        "verifier_company": r.verifier_company, "verifier_user": r.verifier_user,
+        "requested_at": r.requested_at, "result": r.result, "reasons": json.loads(r.reason or "[]"),
+        "blockchain_status": r.blockchain_status, "hash_status": r.hash_status, "lifecycle_status": r.lifecycle_status,
+        "risk_score": r.risk_score,
+    }
+    if include_detail and r.result_detail:
+        d["detail"] = json.loads(r.result_detail)
+    return d
+
+
 # ---------------------------------------------------------------- simulation control
 
 @router.post("/simulation/start")
-def simulation_start():
-    get_simulator().start()
-    return get_simulator().status()
+def simulation_start(payload: schemas.SimulationConfig | None = Body(default=None)):
+    """Starting always applies whatever config is passed *first*, so the
+    fraud-probability/interval currently selected in the UI takes effect
+    immediately on this run -- no separate "apply" step required, and no
+    backend/frontend restart needed."""
+    sim = get_simulator()
+    if payload is not None:
+        sim.start(payload.interval_seconds, payload.fraud_probability, payload.tamper_enabled, payload.tamper_probability)
+    else:
+        sim.start()
+    return sim.status()
 
 
 @router.post("/simulation/stop")
@@ -217,13 +420,53 @@ def simulation_stop():
 
 @router.post("/simulation/config")
 def simulation_config(payload: schemas.SimulationConfig):
-    get_simulator().configure(payload.interval_seconds, payload.fraud_probability)
+    """Updates the live config. Since `Simulator.tick()` reads
+    `self.fraud_probability`/`self.interval` fresh on every tick, this takes
+    effect on the very next tick of an already-running simulation, with no
+    restart required."""
+    get_simulator().configure(payload.interval_seconds, payload.fraud_probability,
+                               payload.tamper_enabled, payload.tamper_probability)
     return get_simulator().status()
 
 
 @router.get("/simulation/status")
 def simulation_status():
     return get_simulator().status()
+
+
+@router.post("/simulation/reset")
+def simulation_reset(db: Session = Depends(get_db)):
+    """Reset Transactions: stops the simulator, clears every
+    simulator-generated table (RECs, generation records, transactions,
+    fraud alerts, graph entities/edges, fraud clusters), resets the
+    in-memory graph and simulator counters, and starts a new
+    simulation_run_id -- see Simulator.reset_all's docstring for exactly
+    what is and isn't touched. Broadcasts a `simulation_reset` WebSocket
+    event so every connected dashboard clears its live view immediately,
+    without a page refresh."""
+    sim = get_simulator()
+    counts = sim.reset_all(db)
+    status = sim.status()
+
+    payload = {
+        "type": "simulation_reset",
+        "message": "All simulation transactions cleared",
+        "transaction_count": 0,
+        "fraud_alert_count": 0,
+        "graph_node_count": 0,
+        "graph_edge_count": 0,
+        "simulation_run_id": status["simulation_run_id"],
+    }
+    websocket_service.broadcast_sync(payload)
+
+    return {
+        "success": True,
+        "message": "Simulation data reset successfully",
+        "transaction_count": 0,
+        "cleared": counts,
+        "simulation_run_id": status["simulation_run_id"],
+        "simulation": status,
+    }
 
 
 # ---------------------------------------------------------------- manual pipeline entry points

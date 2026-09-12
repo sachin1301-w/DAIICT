@@ -77,13 +77,23 @@ class BlockchainService:
 
     def status(self) -> dict:
         if self.is_online:
-            return {
-                "status": "ONLINE",
-                "provider": config.WEB3_PROVIDER_URI,
-                "contract_address": self.contract.address,
-                "chain_id": self.w3.eth.chain_id,
-                "block_number": self.w3.eth.block_number,
-            }
+            try:
+                return {
+                    "status": "ONLINE",
+                    "provider": config.WEB3_PROVIDER_URI,
+                    "contract_address": self.contract.address,
+                    "chain_id": self.w3.eth.chain_id,
+                    "block_number": self.w3.eth.block_number,
+                }
+            except Exception as e:
+                # `is_online` only checked that we *were* connected -- the
+                # node can still have died between that check and this call
+                # (observed directly: a long-running Hardhat node dying
+                # mid-session). Drop the stale handles so the next call
+                # retries _connect() instead of tripping this every time.
+                logger.warning("Blockchain went offline mid-request: %s", e)
+                self.w3 = None
+                self.contract = None
         return {"status": "OFFLINE", "provider": config.WEB3_PROVIDER_URI, "reason": "no connection to Hardhat node"}
 
     # ---------------- signing helper ----------------

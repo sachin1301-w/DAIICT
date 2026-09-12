@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { api } from "../api.js";
 import BlockchainTimeline from "./BlockchainTimeline.jsx";
+import BlockchainStatusBadge from "./BlockchainStatusBadge.jsx";
 
 const LEVELS = ["ALL", "LOW", "MEDIUM", "HIGH", "CRITICAL"];
 
@@ -11,7 +12,7 @@ const LEVEL_TONE = {
   CRITICAL: "bg-red-900/40 text-red-400",
 };
 
-export default function FraudAlerts() {
+export default function FraudAlerts({ resetEpoch = 0 }) {
   const [alerts, setAlerts] = useState([]);
   const [level, setLevel] = useState("ALL");
   const [selectedId, setSelectedId] = useState(null);
@@ -25,7 +26,11 @@ export default function FraudAlerts() {
     load();
     const id = setInterval(load, 5000);
     return () => clearInterval(id);
-  }, [level]);
+  }, [level, resetEpoch]);
+
+  useEffect(() => {
+    if (resetEpoch > 0) setSelectedId(null);
+  }, [resetEpoch]);
 
   useEffect(() => {
     if (!selectedId) {
@@ -134,8 +139,14 @@ export default function FraudAlerts() {
               <div className="mb-4">
                 <div className="text-slate-500 mb-1">Certificate</div>
                 <div className="font-mono">{detail.rec.rec_id}</div>
-                <div className="text-slate-400">
+                <div className="text-slate-400 mb-2">
                   {detail.rec.quantity} qty &middot; status {detail.rec.status}
+                </div>
+                <div className="flex items-center gap-2">
+                  <BlockchainStatusBadge status={detail.rec.blockchain_status} />
+                  {detail.rec.blockchain_verification_message && (
+                    <span className="text-slate-500">{detail.rec.blockchain_verification_message}</span>
+                  )}
                 </div>
               </div>
             )}
