@@ -10,7 +10,8 @@ BASE_DIR = Path(__file__).resolve().parent
 
 # ---------------- database ----------------
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{BASE_DIR / 'rec_fraud.db'}")
-
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 # ---------------- simulation ----------------
 SIMULATION_INTERVAL_SECONDS = float(os.getenv("SIMULATION_INTERVAL_SECONDS", "5"))
 FRAUD_PROBABILITY = float(os.getenv("FRAUD_PROBABILITY", "0.15"))
