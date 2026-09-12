@@ -1,0 +1,66 @@
+# Render Blueprint -- lets you deploy both services at once via Render's
+# "New +" -> "Blueprint" flow, pointed at this repo.
+#
+# NOTE: Render's exact Blueprint schema can change over time and I can't
+# test this against a live Render account from here -- if importing this
+# fails, cross-check the field names against Render's current Blueprint
+# docs (render.com/docs/blueprint-spec) and adjust. The manual "New Web
+# Service" / "New Static Site" flow in Render's dashboard works too, using
+# the same settings written out below in each service's comments, without
+# needing this file at all.
+
+services:
+  # ---------------------------------------------------------------
+  # Backend: FastAPI + the simulator + a local Hardhat blockchain,
+  # all inside one Docker container (see Dockerfile + render-start.sh).
+  # ---------------------------------------------------------------
+  - type: web
+    name: rec-guard-backend
+    env: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      # Set this manually in the Render dashboard (Neon connection string) --
+      # never commit a real one to this file.
+      - key: DATABASE_URL
+        sync: false
+      # Update this to your actual frontend URL once Render assigns it
+      # (shown after the frontend service's first deploy).
+      - key: CORS_ORIGINS
+        value: https://rec-guard-frontend.onrender.com
+      # The blockchain node runs inside this same container -- always
+      # localhost from the backend's point of view, same as local dev.
+      - key: WEB3_PROVIDER_URI
+        value: http://127.0.0.1:8545
+      - key: SIMULATION_INTERVAL_SECONDS
+        value: "5"
+      - key: FRAUD_PROBABILITY
+        value: "0.15"
+      - key: TAMPERING_SIMULATION_ENABLED
+        value: "true"
+      - key: TAMPERING_PROBABILITY
+        value: "0.05"
+      - key: GRAPH_LOOKBACK_SECONDS
+        value: "1800"
+
+  # ---------------------------------------------------------------
+  # Frontend: static React build, served directly by Render (no
+  # Node.js process needed at runtime -- it's just static files).
+  # ---------------------------------------------------------------
+  - type: web
+    name: rec-guard-frontend
+    env: static
+    buildCommand: cd frontend && npm install && npm run build
+    staticPublishPath: frontend/dist
+    envVars:
+      # Update this to your actual backend URL once Render assigns it.
+      - key: VITE_API_BASE
+        value: https://rec-guard-backend.onrender.com
+    routes:
+      # Client-side routing fallback (this app is a single-page app with
+      # no server-side routes of its own).
+      - type: rewrite
+        source: /*
+        destination: /index.html
