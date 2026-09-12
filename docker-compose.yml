@@ -1,0 +1,57 @@
+# Best-effort containerization for the three services. The Hardhat node's
+# chain state is in-memory (see contracts/README-style notes in the root
+# README's "Start Blockchain" section) -- the deploy step must run every
+# time the hardhat_node container (re)starts, same as running it by hand.
+services:
+  hardhat_node:
+    image: node:20-bullseye
+    working_dir: /app/contracts
+    volumes:
+      - ./contracts:/app/contracts
+      - ./backend/chain:/app/backend/chain
+    command: sh -c "npm install && npx hardhat node --hostname 0.0.0.0"
+    ports:
+      - "8545:8545"
+
+  contract_deploy:
+    image: node:20-bullseye
+    working_dir: /app/contracts
+    volumes:
+      - ./contracts:/app/contracts
+      - ./backend/chain:/app/backend/chain
+    depends_on:
+      - hardhat_node
+    command: >
+      sh -c "npm install &&
+             until curl -s http://hardhat_node:8545 >/dev/null; do sleep 1; done &&
+             npx hardhat run scripts/deploy.js --network localhost &&
+             npx hardhat run scripts/seed_roles.js --network localhost"
+    environment:
+      - HARDHAT_NETWORK_URL=http://hardhat_node:8545
+
+  backend:
+    image: python:3.12-slim
+    working_dir: /app/backend
+    volumes:
+      - ./backend:/app/backend
+    depends_on:
+      - contract_deploy
+    command: sh -c "pip install -r requirements.txt && python app.py"
+    environment:
+      - WEB3_PROVIDER_URI=http://hardhat_node:8545
+      - CORS_ORIGINS=http://localhost:5173
+    ports:
+      - "8000:8000"
+
+  frontend:
+    image: node:20-bullseye
+    working_dir: /app/frontend
+    volumes:
+      - ./frontend:/app/frontend
+    depends_on:
+      - backend
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    environment:
+      - VITE_API_BASE=http://localhost:8000
+    ports:
+      - "5173:5173"

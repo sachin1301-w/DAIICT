@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# backend runtime data
+backend/rec_fraud.db
+backend/models/tx_isolation_forest_model.pkl
+backend/models/tx_scaler.pkl
+backend/models/tx_feature_names.json
+
+# node / vite
+node_modules/
+frontend/dist/
+contracts/cache/
+contracts/artifacts/
+
+# ml_training generated outputs
+ml_training/*.pkl
+ml_training/*.json
+ml_training/*.csv
+
+# env
+.env

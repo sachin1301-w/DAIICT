@@ -1,0 +1,17 @@
+# Root convenience file for `pip install -r requirements.txt` per the spec's
+# installation instructions. Mirrors backend/requirements.txt exactly (the
+# backend is the only Python service; ml_training/requirements.txt is a
+# separate, smaller set for offline model training and isn't needed to run
+# the app itself).
+fastapi>=0.115
+uvicorn[standard]>=0.30
+sqlalchemy>=2.0
+pydantic>=2.7
+scikit-learn>=1.6
+xgboost>=2.0
+networkx>=3.4
+pandas>=2.0
+numpy>=1.26
+joblib>=1.4
+web3>=7.0
+python-dotenv>=1.0
